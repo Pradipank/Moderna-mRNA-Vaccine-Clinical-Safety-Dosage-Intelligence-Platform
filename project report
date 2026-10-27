@@ -1,0 +1,111 @@
+# mRNA-VIP Portfolio Report — Clinical Safety & Dosage Intelligence Platform
+
+> **Student engineering project — not real clinical guidance.**
+
+## 1. Executive Summary
+This system scores a patient's vaccine-reaction risk with a classical ML model, demonstrates Transformer self-attention from scratch on an mRNA sequence, retrieves the relevant passages of a regulatory-style guideline document (RAG), and combines the risk score and retrieved text into a schema-validated, citation-checked safety report protected by deterministic guardrails. It demonstrates applied ML evaluation, deep-learning fundamentals, retrieval, and safe, grounded LLM-style generation. **Honest scope note:** this build ran offline, so retrieval used TF-IDF and report generation used a rule-based generator, not a hosted LLM (details in README §Deviations). All 28 requirement tests pass.
+
+## 2. Architecture
+```
+ patient_records.csv                      mrna_safety_guidelines.txt
+        |                                            |
+        v                                            v
+ [M1] clean -> LR / RF classifier         [M3] chunk -> embed -> persistent index
+        |  risk label + probability                  |  top-k guideline chunks
+        |                                            |
+        |        [M2] self-attention heatmap         |
+        |        (standalone sequence demo)          |
+        +--------------------+-----------------------+
+                             v
+        [M4] prompt -> LLM -> schema check (+1 retry) -> guardrails
+                             v
+             ClinicalSafetyReport  (.json + .md, with disclaimer)
+                             v
+        [M5] dashboard.png  (ROC | attention | latency)
+```
+
+## 3. Module 1 — Classifier (test set n=100, seed 42, stratified 80/20)
+| Model | F1 (High) | Precision | Recall | Accuracy | Test AUC | 5-fold CV AUC (train) |
+|---|---|---|---|---|---|---|
+| **Logistic Regression (selected)** | **0.70** | 0.73 | 0.67 | 0.72 | 0.77 | 0.81 ± 0.05 |
+| Random Forest (200 trees) | 0.65 | 0.66 | 0.63 | 0.66 | 0.73 | 0.77 ± 0.05 |
+
+![Confusion matrix - selected model](outputs/figures/confusion_matrix_logistic_regression.png)
+Classification report: `outputs/figures/classification_report_logistic_regression.txt`. EDA figures: `outputs/figures/eda_*.png`.
+
+**Written comparison (Week 1).** Logistic Regression outperformed Random Forest on every metric (F1 0.70 vs 0.65; test AUC 0.77 vs 0.73). With only 400 noisy training rows and mostly smooth, monotone effects (age, dose, biomarker, condition count), the low-variance linear model generalises better, while 200 deep trees fit noise. The 100-row test set is small, so the ~6-point F1 gap is suggestive rather than conclusive, though the cross-validated AUCs (0.81 vs 0.77) point the same way. Scores are plausible, not suspiciously perfect. (Selecting on test F1, as the spec requires, also makes the reported test score slightly optimistic.)
+
+## 4. Module 2 — Self-attention
+`Attention(Q,K,V)=softmax(QKᵀ/√d_k)V`, sequence `ACGUACGUACGGCUA`, embedding dim 8, one head. Row sums are asserted to equal 1; weights range 0.005–0.357 (uniform = 0.067).
+
+![Attention heatmap](outputs/figures/attention_heatmap.png)
+
+**Explanation.** Each base is looked up in a random 8-dimensional embedding table and a sinusoidal position signal is added, giving a 15×8 matrix X. Three random weight matrices turn X into queries Q (what each position is looking for), keys K (what it offers) and values V (what it contributes). Q·Kᵀ gives a 15×15 grid of dot-product similarities; dividing by √8 keeps these from growing with dimension, and a row-wise softmax turns each row into probabilities summing to one. Multiplying by V blends value vectors according to those probabilities. In the heatmap, row *i* shows where position *i* looks. The strongest single link is position 6 (C) attending to position 5 (A), weight 0.36. By base type, A and U tend to attend to C, while C attends to A. Because the weights are random, this reflects the random initialisation and position encoding, not biology: nothing was trained. With the template's 0.1 weight scale the weights collapsed to near-uniform (0.063–0.070), so I used 0.5. Without positional encoding, identical bases yield identical rows. *(Bonus multi-head attention is implemented and tested.)*
+
+## 5. Module 3 — Retrieval
+The ~900-token guideline became **3 chunks (341/338/325 tokens, 50-token overlap)**, sentence-aligned, target ≈350. Backend this run: TF-IDF (persisted in `outputs/chroma_store/`).
+
+**Sample query and retrieved chunk.** *"What dose needs secondary clinician review?"* → top chunk (similarity 0.19, 0.38 ms), relevant passage:
+> …ulations are frequently dosed between 25 and 50 micrograms. Doses above 100 micrograms are considered high-reactogenicity doses and require secondary clinician review before administration.  2.2 Age-Banded Reference Doses  - Ages 6 months to 4 years: lowest available dose tier; administrat…
+
+Full 7-question table (question, top result, latency): `outputs/rag_retrieval_eval.md` — top-1 correct on 6/6 in-scope questions.
+
+**Retrieval quality.** Good on this corpus, but weak evidence: with 3 chunks, chance is 33%, and the per-patient query union usually returns all three chunks.
+**Chunk-size choices.** A 500-token maximum made only 2 oversized chunks mixing storage and dosing; ~350 tokens gives 3 tighter chunks. The 50-token overlap avoids losing sentences at boundaries (chunk 2 still begins mid-sentence).
+**Failure case.** *"Is it safe to vaccinate someone with kidney disease?"* is not covered by the guideline, yet the retriever returned a chunk (similarity 0.00) — it always returns top-k and has no relevance cut-off, and TF-IDF finds no overlapping terms. Fix: add a similarity threshold so "not covered" leads to the conservative not-eligible default.
+
+## 6. Module 4 — Grounded report (full sample, annotated)
+Patient: *52-year-old, 0 pre-existing condition(s), biomarker 2.00 mg/L, prior reaction history: None, candidate dose 90.8 mcg*. Risk model → **Low (p=0.10)**.
+```json
+{
+  "Eligible_For_Vaccine": true,
+  "Recommended_Dose_mg": 0.0908,
+  "Reasoning_Steps": [
+    "Risk model output: Low reaction risk (probability 0.10).",
+    "Checked with no trigger: max_dose_bound, age65_multi_condition, three_plus_conditions, prior_moderate_reaction, high_dose_and_elevated_biomarker, elevated_biomarker_defer.",
+    "Allergy / anaphylaxis history is not part of the supplied patient record; contraindication screening must be completed by a clinician.",
+    "No guideline precaution was triggered and predicted risk is Low; candidate dose is within the stated threshold."
+  ],
+  "FDA_Safety_Warnings_Cited": [
+    "Patients should be monitored for at least 15 minutes following administration, or 30 minutes for patients with a documented history of any allergic reaction.",
+    "Doses above 100 micrograms are considered high-reactogenicity doses and require secondary clinician review before administration."
+  ],
+  "Disclaimer": "Student engineering project output — not real clinical guidance."
+}
+```
+**How it is grounded:**
+- `Eligible_For_Vaccine` / reasoning step 1 come from **Module 1** (risk label and probability) combined with rule checks.
+- `FDA_Safety_Warnings_Cited` are **verbatim sentences from Module 3's retrieved chunks** (checked as exact substrings; anything else is dropped).
+- `Recommended_Dose_mg` = candidate dose 90.8 mcg ÷ 1000, allowed because the retrieved guideline's 100 mcg bound was not exceeded.
+- `Disclaimer` is enforced by a guardrail regardless of provider output.
+- Provider: `offline-rule-based (not an LLM)`, attempts: 1, guardrail actions: none.
+
+| Sample case | Risk | Decision | Why |
+|---|---|---|---|
+| high_dose | High 0.96 | Not eligible | dose > 100 mcg; high risk |
+| age65_multi_cond | High 0.96 | Not eligible | age ≥65 with ≥2 conditions |
+| prior_moderate | Low 0.43 | Not eligible | prior moderate reaction → secondary review |
+| three_plus_cond | High 0.96 | Not eligible | ≥3 conditions |
+| low_risk_standard | Low 0.10 | Eligible, 0.0908 mg | no precaution triggered |
+
+**Design decisions to review:** >100 mcg "requires secondary review" in the guideline, but FR-4.4 treats it as a bound, so such patients are marked not eligible; "elevated biomarker" has no numeric cut-off in the guideline, so the training-set 75th percentile (7.0 mg/L) is used and labelled dataset-relative; High predicted risk alone → not eligible (conservative, not stated in the guideline); allergy history is absent from the data, so contraindications are flagged as unassessable. All five reports: `outputs/reports/`.
+
+## 7. Dashboard
+![Dashboard](outputs/figures/dashboard.png)
+Left: ROC curve of the selected classifier (AUC 0.77). Middle: attention weights. Right: per-stage latency on a log scale; it compares retrieval to the *offline* generator, so it says nothing about real LLM latency.
+
+## 8. Limitations & Future Work
+1. **Tiny synthetic data (500 rows, 100 test):** wide confidence intervals. → repeated CV, calibration, external validation.
+2. **Lexical retrieval over a 3-chunk corpus:** → sentence-transformer embeddings + ChromaDB (already coded), a similarity threshold, a larger multi-document corpus.
+3. **No real LLM exercised:** the rule engine hides hallucination/format-drift risks and real cost/latency. → run the Anthropic/OpenAI path on a labelled prompt set; measure citation validity and guardrail trigger rates.
+4. **Attention is untrained and disconnected from the report:** didactic only. → train a sequence model if sequence features should affect risk.
+5. **Rules hand-coded from one document:** → move thresholds to versioned config and add a rule-coverage test per guideline section.
+
+## 9. Reproduction Instructions
+```bash
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+python run_pipeline.py                       # everything (add --provider anthropic|openai after setting .env)
+python -m unittest discover -s tests -v      # 28 tests
+```
+Per-week commands are in the README.
